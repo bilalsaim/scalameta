@@ -1,0 +1,266 @@
+import os
+import re
+from collections import defaultdict
+
+def analyze_scala_field_usage(project_root_dir: str, target_class_name: str) -> str:
+    """
+    Analyzes the usage of fields of a specified Scala class within a project.
+    This uses a heuristic text-based approach and is not a full static analyzer.
+
+    Args:
+        project_root_dir (str): The root directory of the Scala project.
+        target_class_name (str): The name of the class (e.g., "Posting") whose fields
+                                 you want to analyze.
+    Returns:
+        str: A string containing the full usage report.
+    """
+    report_lines = []
+    
+    report_lines.append(f"Starting analysis for class '{target_class_name}' in '{project_root_dir}'...\n")
+
+    scala_files = []
+    for root, _, files in os.walk(project_root_dir):
+        for file in files:
+            if file.endswith(".scala"):
+                scala_files.append(os.path.join(root, file))
+
+    if not scala_files:
+        report_lines.append("No Scala files found in the specified directory.")
+        return "\n".join(report_lines)
+
+    # Step 1: Find the target class definition and extract its fields
+    target_class_fields = {} # field_name -> (val/var, defined_in_file)
+    target_class_found_in_file = None
+
+    class_definition_pattern = re.compile(
+        rf"(?:class|case class|trait)\s+{re.escape(target_class_name)}\b.*?\((.*?)\)",
+        re.DOTALL
+    )
+    field_declaration_pattern = re.compile(
+        r"\b(val|var)\s+(\w+)\s*:\s*\S+" # Captures 'val' or 'var' and the field name
+    )
+    # Also consider fields defined in the class body (e.g., `val x = ...` or `var y = ...`)
+    body_field_declaration_pattern = re.compile(
+        r"^\s*(val|var)\s+(\w+)\s*=", re.MULTILINE
+    )
+
+    report_lines.append(f"Searching for class '{target_class_name}' definition...")
+    for filepath in scala_files:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            match = class_definition_pattern.search(content)
+            if match:
+                report_lines.append(f"Found class definition in: {filepath}")
+                target_class_found_in_file = filepath
+                constructor_params = match.group(1)
+
+                # Extract fields from constructor parameters
+                for field_match in field_declaration_pattern.finditer(constructor_params):
+                    field_type = field_match.group(1)
+                    field_name = field_match.group(2)
+                    target_class_fields[field_name] = (field_type, filepath)
+                    report_lines.append(f"  - Detected constructor field: {field_name} ({field_type})")
+
+                # Look for fields defined within the class body
+                # This is a very rough heuristic and might catch local vars as well
+                class_body_content = content[match.end():] # Content after the constructor params
+                class_body_lines = class_body_content.split('\n')
+                for i, line in enumerate(class_body_lines):
+                    body_field_match = body_field_declaration_pattern.match(line)
+                    if body_field_match:
+                        field_type = body_field_match.group(1)
+                        field_name = body_field_match.group(2)
+                        # Avoid re-adding if already found in constructor
+                        if field_name not in target_class_fields:
+                            target_class_fields[field_name] = (field_type, filepath)
+                            report_lines.append(f"  - Detected body field: {field_name} ({field_type})")
+
+                break # Assume only one definition per project for simplicity
+
+    if not target_class_fields:
+        report_lines.append(f"Could not find any fields for class '{target_class_name}' or class definition itself.")
+        return "\n".join(report_lines)
+
+    report_lines.append(f"\nIdentified fields for '{target_class_name}': {list(target_class_fields.keys())}\n")
+
+    # Step 2: Analyze usage of each field across all Scala files
+    field_usage = defaultdict(lambda: defaultdict(lambda: {"read": 0, "write": 0, "readwrite": 0}))
+
+    for filepath in scala_files:
+        if filepath == target_class_found_in_file:
+            continue # Skip the definition file itself for external usage analysis
+
+        module_name = os.path.basename(os.path.dirname(filepath)) # Simple module proxy
+        
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            
+            for field_name, (field_type, _) in target_class_fields.items():
+                # Regex to find field access. This is still very basic.
+                # It tries to avoid matching field names in comments or strings.
+                # It looks for patterns like `.`field_name or ` `field_name
+                field_access_pattern = re.compile(
+                    rf"(?<!['\"])\b{re.escape(field_name)}\b(?![.'\"])", # Basic word boundary, avoiding string/char literals
+                    re.IGNORECASE
+                )
+                
+                # Iterate through all lines to try and detect context
+                lines = content.split('\n')
+                for line_num, line in enumerate(lines):
+                    # Skip comments and string literals
+                    if line.strip().startswith("//") or re.search(r'".*' + re.escape(field_name) + r'.*"', line):
+                        continue
+
+                    # Very basic detection of write vs. read
+                    # This needs significant improvement for real-world scenarios
+                    if field_access_pattern.search(line):
+                        is_write = False
+                        # Check for assignment patterns
+                        if re.search(rf"\b{re.escape(field_name)}\s*=\s*", line) or \
+                           re.search(rf"\b{re.escape(field_name)}\s*\+=\s*", line) or \
+                           re.search(rf"\b{re.escape(field_name)}\s*-=\s*", line) or \
+                           re.search(rf"\b{re.escape(field_name)}\s*\*=\s*", line) or \
+                           re.search(rf"\b{re.escape(field_name)}\s*\/=\s*", line):
+                            is_write = True
+                        
+                        # If a 'var' field is just mentioned without an assignment, it's a read.
+                        # If a 'val' field is mentioned, it's always a read.
+                        # If it's a 'var' and a write is detected, it's a write.
+                        # If it's a 'var' and both read and write are detected in the same line, it's readwrite.
+                        
+                        if is_write:
+                            # If it's a 'var' and also appears on the right side of an assignment or in an expression
+                            if field_type == "var" and re.search(rf"=\s*.*?{re.escape(field_name)}\b", line):
+                                field_usage[field_name][module_name]["readwrite"] += 1
+                            else:
+                                field_usage[field_name][module_name]["write"] += 1
+                        else:
+                            field_usage[field_name][module_name]["read"] += 1
+
+    # Step 3: Report the findings
+    report_lines.append("\n--- Field Usage Report ---")
+    if not field_usage:
+        report_lines.append("No usages found for the specified class fields outside their definition file.")
+        return "\n".join(report_lines)
+
+    for field_name, module_data in field_usage.items():
+        report_lines.append(f"\nField: '{field_name}' (Defined as '{target_class_fields[field_name][0]}')")
+        for module, counts in module_data.items():
+            usage_type = []
+            if counts["read"] > 0 and counts["write"] == 0 and counts["readwrite"] == 0:
+                usage_type.append("Read")
+            if counts["write"] > 0 and counts["read"] == 0 and counts["readwrite"] == 0:
+                usage_type.append("Write")
+            if counts["readwrite"] > 0 or (counts["read"] > 0 and counts["write"] > 0):
+                usage_type.append("Read/Write")
+
+            if not usage_type:
+                usage_type.append("Undetermined (likely read)") # Fallback for simple mentions
+
+            report_lines.append(f"  Module: '{module}'")
+            report_lines.append(f"    Usage Type: {', '.join(usage_type)}")
+            report_lines.append(f"    (Heuristic Counts: Reads={counts['read']}, Writes={counts['write']}, Read/Writes={counts['readwrite']})")
+    
+    return "\n".join(report_lines)
+
+# --- Example Usage ---
+# To run this, replace 'path/to/your/scala/project' with the actual path
+# and 'Posting' with the name of your target class.
+
+# Example project structure for testing (create these files manually):
+#
+# my_scala_project/
+# ├── src/
+# │   ├── main/
+# │   │   ├── scala/
+# │   │   │   ├── com/
+# │   │   │   │   ├── example/
+# │   │   │   │   │   ├── model/
+# │   │   │   │   │   │   └── Posting.scala
+# │   │   │   │   │   ├── service/
+# │   │   │   │   │   │   └── PostingService.scala
+# │   │   │   │   │   └── util/
+# │   │   │   │   │       └── DataProcessor.scala
+#
+#
+# Content for Posting.scala:
+# package com.example.model
+#
+# class Posting(var title: String, val content: String, private var _viewCount: Int) {
+#   val creationTime: Long = System.currentTimeMillis()
+#
+#   def incrementViewCount(): Unit = {
+#     _viewCount += 1 // This is a read-modify-write
+#   }
+#
+#   def getViewCount: Int = _viewCount
+# }
+#
+# Content for PostingService.scala:
+# package com.example.service
+#
+# import com.example.model.Posting
+#
+# object PostingService {
+#   def createAndProcessPosting(newTitle: String, newContent: String): Posting = {
+#     val posting = new Posting(newTitle, newContent, 0)
+#     println(s"New posting created: ${posting.title}") // Read title
+#     processContent(posting.content) // Read content
+#     posting.title = "Updated: " + newTitle // Write title
+#     // posting.content = "New content" // This would be a compile error if uncommented (val)
+#     posting.incrementViewCount() // Calls a method that modifies _viewCount
+#     println(s"View count after update: ${posting.getViewCount}") // Read _viewCount via getter
+#     posting
+#   }
+#
+#   private def processContent(content: String): Unit = {
+#     println(s"Processing content: ${content.toUpperCase()}")
+#   }
+# }
+#
+# Content for DataProcessor.scala:
+# package com.example.util
+#
+# import com.example.model.Posting
+#
+# object DataProcessor {
+#   def analyzePosting(p: Posting): Unit = {
+#     println(s"Analyzing posting with title: ${p.title}") // Read title
+#     println(s"Content length: ${p.content.length}") // Read content
+#     // p._viewCount = 100 // This would be a compile error if uncommented (private var)
+#     // Although _viewCount is private, a method call like p.incrementViewCount()
+#     // would indirectly cause a write, but this script won't detect that level.
+#   }
+# }
+
+
+if __name__ == "__main__":
+    # IMPORTANT: Replace this with the actual path to your Scala project's root directory.
+    # For example: current_dir = os.path.dirname(os.path.abspath(__file__))
+    #              project_path = os.path.join(current_dir, "my_scala_project")
+    # For testing, you'd create 'my_scala_project' and the files mentioned above.
+    
+    # Example using a relative path for demonstration (assuming the script is run from a parent directory)
+    current_script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_path = os.path.join(current_script_dir, "my_scala_project") 
+    
+    # Fallback if the above path doesn't exist (e.g. if the script is run differently)
+    if not os.path.isdir(project_path):
+        print(f"Default project path '{project_path}' not found.")
+        project_path = input("Please enter the absolute path to your Scala project root directory: ")
+
+    class_to_analyze = "Posting" # Replace with your target class name
+    output_filename = "posting_field_usage_report.txt" # Name of the output file
+
+    # Get the report as a string
+    full_report = analyze_scala_field_usage(project_path, class_to_analyze)
+
+    # Write the report to a file
+    with open(output_filename, 'w', encoding='utf-8') as f:
+        f.write(full_report)
+    
+    print(f"\nAnalysis complete. Report written to '{output_filename}'")
+    # Also print to console for immediate feedback
+    print("\n--- Console Output of Report ---")
+    print(full_report)
+    print("------------------------------")
