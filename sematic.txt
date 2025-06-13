@@ -1,0 +1,64 @@
+addCompilerPlugin("org.scalameta" % "semanticdb-scalac" % "4.8.10" cross CrossVersion.full)
+
+In build.sbt:
+
+scalacOptions += "-Yrangepos"
+ThisBuild / semanticdbEnabled := true
+ThisBuild / semanticdbOptions += "-P:semanticdb:synthetics:on"
+
+3️⃣ Compile to generate SemanticDB
+sbt compile
+
+
+target/semanticdb/...
+
+metap target/semanticdb/src/main/scala/MyCode.scala.semanticdb
+This will output symbols + type info like:
+
+val posting: Posting
+...
+p.field1: String
+p.field2: String
+
+
+import scala.meta.internal.semanticdb._
+import scala.meta.internal.semanticdb.TextDocuments
+import java.nio.file._
+
+val semanticdbRoot = Paths.get("target/semanticdb")
+
+Files.walk(semanticdbRoot).iterator().forEachRemaining { path =>
+  if (path.toString.endsWith(".semanticdb")) {
+    val bytes = Files.readAllBytes(path)
+    val doc = TextDocuments.parseFrom(bytes).documents.head
+
+    doc.symbols.foreach { sym =>
+      println(s"Symbol: ${sym.symbol} - ${sym.displayName} - ${sym.kind}")
+    }
+
+    doc.occurrences.foreach { occ =>
+      val role = occ.role match {
+        case SymbolOccurrence.Role.REFERENCE => "Read"
+        case SymbolOccurrence.Role.DEFINITION => "Write" // loose mapping; adjust
+        case _ => "Other"
+      }
+      println(s"${occ.range.map(_.toString).getOrElse("?")}: ${occ.symbol} $role")
+    }
+  }
+}
+
+
+How to refine this
+✅ Filter for Posting fields:
+
+if (occ.symbol.contains("Posting#")) { ... }
+✅ Refine role:
+
+REFERENCE = read
+
+DEFINITION = field def / val / var
+
+WRITE is not directly marked → but you can track Assign in synthetics or AST.
+
+✅ Link to source lines:
+Use .range → match back to source code lines
